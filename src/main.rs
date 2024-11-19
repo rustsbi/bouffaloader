@@ -143,6 +143,11 @@ fn run_cli<W: Write, R: Read, L: OutputPin, SPI, PADS, const I: usize>(
         Write { addr: &'a str, val: &'a str },
         /// Boot Linux kernel.
         Boot,
+        /// Bootargs command.
+        Bootargs {
+            #[command(subcommand)]
+            command: Option<BootargsCommand<'a>>,
+        },
     }
 
     #[derive(Command)]
@@ -153,6 +158,17 @@ fn run_cli<W: Write, R: Read, L: OutputPin, SPI, PADS, const I: usize>(
         Off,
         /// Switch LED state.
         Switch,
+    }
+
+    #[derive(Command)]
+    enum BootargsCommand<'a> {
+        /// Print the bootargs variable in memory.
+        Get,
+        /// Set the bootargs variable in memory to the parameter content.
+        Set {
+            /// Bootargs.
+            bootarg: Option<&'a str>,
+        },
     }
 
     // TODO: more commands.
@@ -213,6 +229,25 @@ fn run_cli<W: Write, R: Read, L: OutputPin, SPI, PADS, const I: usize>(
                             .writer()
                             .write_str("Error: Invalid address or value!")
                             .unwrap(),
+                    }
+                    Base::Bootargs { command } => match command {
+                        Some(BootargsCommand::Get) => {
+                            writeln!(d.tx, "Bootargs: {:?}", _c.bootargs).ok();
+                        }
+                        Some(BootargsCommand::Set { bootarg }) => match bootarg {
+                            Some(bootarg) => {
+                                let bootarg = bootarg.as_bytes();
+                                let len = core::cmp::min(bootarg.len(), _c.bootargs.len());
+                                _c.bootargs[..len].copy_from_slice(&bootarg[..len]);
+                                writeln!(d.tx, "Bootargs set to: {:?}", _c.bootargs).ok();
+                            }
+                            None => {
+                                writeln!(d.tx, "Please enter the parameters of bootargs set").ok();
+                            }
+                        },
+                        None => {
+                            writeln!(d.tx, "Please enter the parameters of bootargs").ok();
+                        }
                     },
                     Base::Boot => {
                         run_payload();
