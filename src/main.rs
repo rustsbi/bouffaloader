@@ -3,6 +3,7 @@
 
 use bouffalo_hal::{prelude::*, spi::Spi};
 use bouffalo_rt::{entry, Clocks, Peripherals};
+use core::fmt::Write as _;
 use core::ptr;
 use embedded_cli::{cli::CliBuilder, Command};
 use embedded_hal::{digital::OutputPin, spi::MODE_3};
@@ -121,7 +122,7 @@ fn run_cli<W: Write, R: Read, L: OutputPin, SPI, PADS, const I: usize>(
     _c: &mut Config,
 ) -> ! {
     #[derive(Command)]
-    enum Base {
+    enum Base<'a> {
         /// Print out 'Hello world!'.
         Hello,
         /// LED control command.
@@ -129,6 +130,12 @@ fn run_cli<W: Write, R: Read, L: OutputPin, SPI, PADS, const I: usize>(
             #[command(subcommand)]
             command: Option<LedCommand>,
         },
+        /// Reload from sdcard.
+        Reload,
+        /// Fetch data from a specified address.
+        Read { addr: &'a str },
+        /// Write a value to a specified address.
+        Write { addr: &'a str, val: &'a str },
     }
 
     #[derive(Command)]
@@ -177,9 +184,82 @@ fn run_cli<W: Write, R: Read, L: OutputPin, SPI, PADS, const I: usize>(
                             PinState::Low => cli.writer().write_str("LED state: On").unwrap(),
                         },
                     },
+                    Base::Reload => {
+                        load_from_sdcard(d, _c);
+                    }
+                    Base::Read { addr } => match parse_hex(addr) {
+                        Some(a) => {
+                            let val = read_memory(a);
+                            let mut buf = heapless::String::<48>::new();
+                            let addr_fmt = format_hex(a, false);
+                            let val_fmt = format_hex(val, false);
+                            write!(&mut buf, "Read value from {}: {}", addr_fmt, val_fmt).unwrap();
+                            cli.writer().write_str(buf.as_str()).unwrap();
+                        }
+                        None => cli.writer().write_str("Error: Invalid address!").unwrap(),
+                    },
+                    Base::Write { addr, val } => match (parse_hex(addr), parse_hex(val)) {
+                        (Some(a), Some(v)) => {
+                            write_memory(a, v);
+                        }
+                        _ => cli
+                            .writer()
+                            .write_str("Error: Invalid address or value!")
+                            .unwrap(),
+                    },
                 }
                 Ok(())
             }),
         );
     }
+}
+
+/// Convert a 32-bit unsigned integer to a hexadecimal string,
+/// The string starts with "0x", and the `uppercase` parameter determines whether the letters are uppercase.
+pub fn format_hex(num: u32, uppercase: bool) -> heapless::String<10> {
+    let mut buf = heapless::String::<10>::new();
+    let _ = buf.push_str("0x");
+    for i in (0..8).rev() {
+        let digit = (num >> (i * 4)) & 0xF;
+        let c = match digit {
+            0x0..=0x9 => (b'0' + digit as u8) as char,
+            0xA..=0xF => {
+                if uppercase {
+                    (b'A' + (digit as u8 - 10)) as char
+                } else {
+                    (b'a' + (digit as u8 - 10)) as char
+                }
+            }
+            _ => unreachable!(),
+        };
+        let _ = buf.push(c);
+    }
+
+    buf
+}
+
+/// Parses a hexadecimal string in the format "0xXXXXXXXX" and converts it to a 32-bit unsigned integer.
+pub fn parse_hex(hex_str: &str) -> Option<u32> {
+    if !hex_str.starts_with("0x") || hex_str.len() != 10 {
+        return None;
+    }
+    let mut result = 0u32;
+    for c in hex_str[2..].chars() {
+        let digit = c.to_digit(16)?;
+        result = result << 4 | digit;
+    }
+
+    Some(result)
+}
+
+/// Reads a 32-bit unsigned integer from the specified memory address using a volatile operation.
+#[inline]
+pub(crate) fn read_memory(addr: u32) -> u32 {
+    unsafe { ptr::read_volatile(addr as *const u32) }
+}
+
+/// Writes a 32-bit unsigned integer value to the specified memory address using a volatile operation.
+#[inline]
+pub(crate) fn write_memory(addr: u32, val: u32) {
+    unsafe { ptr::write_volatile(addr as *mut u32, val) }
 }

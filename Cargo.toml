@@ -17,6 +17,7 @@ embedded-time = "0.12.1"
 embedded-cli = "0.2.1"
 embedded-io = "0.6.1"
 embedded-hal = "1.0.0"
+heapless = "0.8.0"
 
 [[bin]]
 name = "bouffaloader"
