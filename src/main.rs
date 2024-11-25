@@ -1,8 +1,12 @@
 #![no_std]
 #![no_main]
 
+mod psram;
+
+use crate::psram::uhs_psram_init;
 use bouffalo_hal::{prelude::*, spi::Spi};
 use bouffalo_rt::{entry, Clocks, Peripherals};
+use core::arch::asm;
 use core::fmt::Write as _;
 use core::ptr;
 use embedded_cli::{cli::CliBuilder, Command};
@@ -58,7 +62,8 @@ fn main(p: Peripherals, c: Clocks) -> ! {
     writeln!(d.tx, "Welcome to bouffaloader🦀!").ok();
 
     // Initialize PSRAM.
-    // TODO
+    uhs_psram_init();
+    writeln!(d.tx, "UHS PSRAM initialization success").ok();
 
     // Initialize sdcard and load files.
     let mut config = Config { bootargs: [0; 128] };
@@ -262,4 +267,42 @@ pub(crate) fn read_memory(addr: u32) -> u32 {
 #[inline]
 pub(crate) fn write_memory(addr: u32, val: u32) {
     unsafe { ptr::write_volatile(addr as *mut u32, val) }
+}
+
+/// Sets a sequence of bits in a 32-bit unsigned integer.
+///
+/// # Arguments
+///
+/// * `val` - The original value where bits will be set.
+/// * `pos` - The position to start setting bits.
+/// * `len` - The number of bits to be set.
+/// * `val_in` - The value to be inserted into `val` at the specified position.
+///
+/// # Returns
+///
+/// A new `u32` value with the specified bits set.
+#[inline]
+pub(crate) fn set_bits(val: u32, pos: u32, len: u32, val_in: u32) -> u32 {
+    let mask = ((1 << len) - 1) << pos;
+    (val & !mask) | ((val_in << pos) & mask)
+}
+
+/// A function to perform a busy-wait loop for approximately the given number of microseconds.
+/// Note: The actual delay may vary depending on the system's processing speed.
+#[inline]
+pub(crate) fn sleep_us(_: u32) {
+    for _ in 0..1000 {
+        unsafe { asm!("nop") }
+    }
+}
+
+/// A function to perform a busy-wait loop for approximately the given number of milliseconds.
+/// Note: It internally calls `sleep_us` to achieve the delay.
+///
+/// # Arguments
+///
+/// * `n` - The number of milliseconds to wait.
+#[inline]
+pub(crate) fn sleep_ms(n: u32) {
+    sleep_us(n);
 }
