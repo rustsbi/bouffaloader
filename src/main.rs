@@ -4,7 +4,7 @@
 mod psram;
 
 use crate::psram::uhs_psram_init;
-use bouffalo_hal::{prelude::*, spi::Spi};
+use bouffalo_hal::{prelude::*, spi::Spi, uart::Config as UartConfig};
 use bouffalo_rt::{entry, Clocks, Peripherals};
 use core::arch::asm;
 use core::fmt::Write as _;
@@ -12,10 +12,26 @@ use core::ptr;
 use embedded_cli::{cli::CliBuilder, Command};
 use embedded_hal::{digital::OutputPin, spi::MODE_3};
 use embedded_io::Write;
+use embedded_sdmmc::{Mode, SdCard, VolumeManager};
 use embedded_time::rate::*;
 use panic_halt as _;
 
-struct Device<W: Write, R: Read, L: OutputPin, SPI, PADS, const I: usize> {
+struct MyTimeSource {}
+
+impl embedded_sdmmc::TimeSource for MyTimeSource {
+    fn get_timestamp(&self) -> embedded_sdmmc::Timestamp {
+        embedded_sdmmc::Timestamp::from_calendar(2023, 1, 1, 0, 0, 0).unwrap()
+    }
+}
+
+struct Device<
+    W: Write,
+    R: Read,
+    L: OutputPin,
+    SPI: core::ops::Deref<Target = bouffalo_hal::spi::RegisterBlock>,
+    PADS,
+    const I: usize,
+> {
     tx: W,
     rx: R,
     led: L,
@@ -35,10 +51,8 @@ fn main(p: Peripherals, c: Clocks) -> ! {
         let sig2 = p.uart_muxes.sig2.into_transmit::<0>();
         let sig3 = p.uart_muxes.sig3.into_receive::<0>();
 
-        let config = Default::default();
-        let serial = p
-            .uart0
-            .freerun(config, 2000000.Bd(), ((tx, sig2), (rx, sig3)), &c);
+        let config = UartConfig::default().set_baudrate(2000000.Bd());
+        let serial = p.uart0.freerun(config, ((tx, sig2), (rx, sig3)), &c);
 
         serial.split()
     };
@@ -84,27 +98,180 @@ fn main(p: Peripherals, c: Clocks) -> ! {
     run_payload();
 }
 
-fn load_from_sdcard<W: Write, R: Read, L: OutputPin, SPI, PADS, const I: usize>(
+fn load_from_sdcard<
+    W: Write,
+    R: Read,
+    L: OutputPin,
+    SPI: core::ops::Deref<Target = bouffalo_hal::spi::RegisterBlock>,
+    PADS,
+    const I: usize,
+>(
     d: &mut Device<W, R, L, SPI, PADS, I>,
-    _c: &mut Config,
+    c: &mut Config,
 ) -> bool {
     // Initialize sdcard.
-    // TODO
+    const MAX_RETRY_TIME: usize = 10;
+    let mut retry_time = 0;
+    let mut sd_state = true;
+    let delay = riscv::delay::McycleDelay::new(40_000_000);
+    let sdcard = SdCard::new(&mut d.spi, delay);
+    writeln!(d.tx, "Initializing sdcard...").ok();
+    while sdcard.get_card_type().is_none() {
+        core::hint::spin_loop();
+        writeln!(d.tx, "Retrying...").ok();
+        retry_time = retry_time + 1;
+        if retry_time == MAX_RETRY_TIME {
+            writeln!(d.tx, "failed...").ok();
+            sd_state = false;
+        }
+    }
+    // Display sdcard information.
+    writeln!(
+        d.tx,
+        "Card size: {:.2}GB",
+        sdcard.num_bytes().unwrap() as f32 / (1024.0 * 1024.0 * 1024.0)
+    )
+    .ok();
+
+    if sd_state {
+        writeln!(d.tx, "Sdcard initialized.").ok();
+    } else {
+        writeln!(d.tx, "error: Failed to initialize sdcard.").ok();
+    }
 
     // Initialize filesystem.
-    // TODO
+    let mut volume_mgr = VolumeManager::new(sdcard, MyTimeSource {});
+    let volume0 = volume_mgr
+        .open_raw_volume(embedded_sdmmc::VolumeIdx(0))
+        .unwrap();
+    let root_dir = volume_mgr.open_root_dir(volume0).unwrap();
+    // TODO: List all files in root_dir for debugging, remove this after testing.
+    volume_mgr
+        .iterate_dir(root_dir, |entry| {
+            writeln!(d.tx, "Entry: {:?}", entry).ok();
+        })
+        .unwrap();
+    writeln!(d.tx, "Filesystem initialized.").ok();
 
     // Read configuration from `config.toml`.
-    // TODO
+    let mut cfg_state = true;
+    // TODO: Change to realname after testing.
+    let bl808_cfg = "CONFIG~1.TOM";
+    if volume_mgr
+        .find_directory_entry(root_dir, bl808_cfg)
+        .is_err()
+    {
+        cfg_state = false;
+        writeln!(d.tx, "warning: cannot find config file `/config.toml`, using default configuration from DTB file.").ok();
+    }
+    let config_file = volume_mgr
+        .open_file_in_dir(root_dir, bl808_cfg, Mode::ReadOnly)
+        .unwrap();
+    // Read config from raw file.
+    // TODO: Use toml crate to parse config file in later versions.
+    let buffer = &mut [0u8; 128];
+    volume_mgr.read(config_file, buffer).ok();
+    c.bootargs = *buffer;
+
+    let bootargs = core::str::from_utf8(&c.bootargs).unwrap();
+    let start_pos = bootargs.find("bootargs = ").unwrap();
+    let string = &bootargs[start_pos..bootargs.len()];
+    writeln!(d.tx, "Bootargs: {}", string).ok();
 
     // Load `bl808.dtb` to memory.
-    // TODO
+    let mut dtb_state = true;
+    // TODO: Change to realname after testing.
+    let bl808_dtb = "HWDTB~1.5M";
+    let _dtb_addr = 0x51ff_8000;
+    if volume_mgr
+        .find_directory_entry(root_dir, bl808_dtb)
+        .is_err()
+    {
+        dtb_state = false;
+        writeln!(
+            d.tx,
+            "error: cannot find device tree blob file `bl808.dtb`, aborting bootload process.
+"
+        )
+        .ok();
+    }
+    let dtb_file = volume_mgr
+        .open_file_in_dir(root_dir, bl808_dtb, Mode::ReadOnly)
+        .unwrap();
+    let dtb_file_size = volume_mgr.file_length(dtb_file).unwrap() as f32 / 1024.0;
+    if dtb_file_size > 64.0 {
+        dtb_state = false;
+        writeln!(d.tx, "error: /bl808.dtb: file size is {:.2} KB, but maximum supported device tree blob size is 64KB.", dtb_file_size).ok();
+    } else {
+        let buffer = &mut [0u8; 64 * 1024];
+        volume_mgr.read(dtb_file, buffer).ok();
+        // TODO: Uncomment this unsafe code only when you are sure that the 'dtb' file is valid.
+        // unsafe {core::ptr::copy(buffer.as_ptr(), dtb_addr as *mut u8, buffer.len())};
+    }
+    if dtb_state {
+        writeln!(d.tx, "Loading `bl808.dtb` success").ok();
+    } else {
+        writeln!(d.tx, "error: Loading `bl808.dtb` failed").ok();
+    }
+
+    volume_mgr.close_file(dtb_file).ok();
 
     // Load `zImage` to memory.
-    // TODO
+    let mut zimage_state = true;
+    // TODO: Change to realname after testing.
+    let bl808_z_img = "HWDTB~1.5M";
+    let _z_image_addr = 0x5000_0000;
+    if volume_mgr
+        .find_directory_entry(root_dir, bl808_z_img)
+        .is_err()
+    {
+        zimage_state = false;
+        writeln!(
+            d.tx,
+            "error: cannot find device tree blob file `bl808_zImg`, aborting bootload process.
+"
+        )
+        .ok();
+    }
+    let z_image_file = volume_mgr
+        .open_file_in_dir(root_dir, bl808_z_img, Mode::ReadOnly)
+        .unwrap();
 
-    writeln!(d.tx, "load_from_sdcard success").ok();
-    true
+    let z_image_file_size =
+        volume_mgr.file_length(z_image_file).unwrap() as f32 / (1024.0 * 1024.0);
+    if z_image_file_size > 31.96875 {
+        zimage_state = false;
+        writeln!(
+                d.tx,
+                "error: /bl808.zImg: file size is {:.5} MB, but maximum supported zImage size is 31.96875MB.", z_image_file_size).ok();
+    } else {
+        let buffer = &mut [0u8; 32736 * 1024];
+        volume_mgr.read(z_image_file, buffer).ok();
+        // TODO: Uncomment this unsafe code only when you are sure that the 'z_img' file is valid.
+        // unsafe {core::ptr::copy(buffer.as_ptr(), z_image_addr as *mut u8, buffer.len())};
+    }
+
+    if zimage_state {
+        writeln!(d.tx, "Loading `bl808.zImg` success").ok();
+    } else {
+        writeln!(d.tx, "error: Loading `bl808.zImg` failed").ok();
+    }
+
+    volume_mgr.close_file(z_image_file).ok();
+
+    volume_mgr.close_dir(root_dir).unwrap();
+
+    let state = sd_state & cfg_state & dtb_state & zimage_state;
+    match state {
+        true => {
+            writeln!(d.tx, "load_from_sdcard success").ok();
+            state
+        }
+        false => {
+            writeln!(d.tx, "load_from_sdcard failed").ok();
+            state
+        }
+    }
 }
 
 fn run_payload() -> ! {
@@ -122,7 +289,14 @@ fn run_payload() -> ! {
     loop {}
 }
 
-fn run_cli<W: Write, R: Read, L: OutputPin, SPI, PADS, const I: usize>(
+fn run_cli<
+    W: Write,
+    R: Read,
+    L: OutputPin,
+    SPI: core::ops::Deref<Target = bouffalo_hal::spi::RegisterBlock>,
+    PADS,
+    const I: usize,
+>(
     d: &mut Device<W, R, L, SPI, PADS, I>,
     _c: &mut Config,
 ) -> ! {
