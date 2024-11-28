@@ -148,6 +148,8 @@ fn run_cli<W: Write, R: Read, L: OutputPin, SPI, PADS, const I: usize>(
             #[command(subcommand)]
             command: Option<BootargsCommand<'a>>,
         },
+        ///print the infomation in configs.bootargs
+        Print, 
     }
 
     #[derive(Command)]
@@ -251,6 +253,10 @@ fn run_cli<W: Write, R: Read, L: OutputPin, SPI, PADS, const I: usize>(
                     },
                     Base::Boot => {
                         run_payload();
+                    }
+                    Base::Print => {
+                        // Print the information about the configs.bootargs variable
+                        writeln!(d.tx, "configs.bootargs = {:?}", _c.bootargs).ok();
                     }
                 }
                 Ok(())
