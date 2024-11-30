@@ -1,17 +1,13 @@
 #![no_std]
 #![no_main]
 
-mod psram;
-
-use crate::psram::uhs_psram_init;
-use bouffalo_hal::{prelude::*, spi::Spi, uart::Config as UartConfig};
+use bouffalo_hal::{prelude::*, psram::init_psram, spi::Spi, uart::Config as UartConfig};
 use bouffalo_rt::{entry, Clocks, Peripherals};
-use core::arch::asm;
-use core::fmt::Write as _;
 use core::ptr;
+use core::{fmt::Write as _, str::FromStr};
 use embedded_cli::{cli::CliBuilder, Command};
 use embedded_hal::{digital::OutputPin, spi::MODE_3};
-use embedded_io::Write;
+use embedded_io::{Read, Write};
 use embedded_sdmmc::{Mode, SdCard, VolumeManager};
 use embedded_time::rate::*;
 use panic_halt as _;
@@ -39,7 +35,7 @@ struct Device<
 }
 
 struct Config {
-    bootargs: [u8; 128],
+    bootargs: heapless::String<128>,
 }
 
 #[entry]
@@ -76,12 +72,15 @@ fn main(p: Peripherals, c: Clocks) -> ! {
     writeln!(d.tx, "Welcome to bouffaloader🦀!").ok();
 
     // Initialize PSRAM.
-    uhs_psram_init();
-    writeln!(d.tx, "UHS PSRAM initialization success").ok();
+    init_psram(&p.psram, &p.glb);
+    writeln!(d.tx, "PSRAM initialization success").ok();
 
     // Initialize sdcard and load files.
-    let mut config = Config { bootargs: [0; 128] };
-    if !load_from_sdcard(&mut d, &mut config) {
+    let mut config = Config {
+        bootargs: heapless::String::new(),
+    };
+    if load_from_sdcard(&mut d, &mut config).is_err() {
+        writeln!(d.tx, "Load from sdcard fail").ok();
         run_cli(&mut d, &mut config);
     }
 
@@ -108,170 +107,119 @@ fn load_from_sdcard<
 >(
     d: &mut Device<W, R, L, SPI, PADS, I>,
     c: &mut Config,
-) -> bool {
-    // Initialize sdcard.
-    const MAX_RETRY_TIME: usize = 10;
-    let mut retry_time = 0;
-    let mut sd_state = true;
+) -> Result<(), ()> {
+    // TODO: return error message
     let delay = riscv::delay::McycleDelay::new(40_000_000);
     let sdcard = SdCard::new(&mut d.spi, delay);
-    writeln!(d.tx, "Initializing sdcard...").ok();
+
+    // Initialize sdcard.
+    writeln!(d.tx, "initializing sdcard...").ok();
+    const MAX_RETRY_TIME: usize = 3;
+    let mut retry_time = 0;
     while sdcard.get_card_type().is_none() {
-        core::hint::spin_loop();
-        writeln!(d.tx, "Retrying...").ok();
         retry_time = retry_time + 1;
         if retry_time == MAX_RETRY_TIME {
-            writeln!(d.tx, "failed...").ok();
-            sd_state = false;
+            writeln!(d.tx, "error: failed to initialize sdcard.").ok();
+            return Err(());
         }
     }
+
     // Display sdcard information.
     writeln!(
         d.tx,
-        "Card size: {:.2}GB",
+        "sdcard initialized success: size = {:.2} GB",
         sdcard.num_bytes().unwrap() as f32 / (1024.0 * 1024.0 * 1024.0)
     )
     .ok();
-
-    if sd_state {
-        writeln!(d.tx, "Sdcard initialized.").ok();
-    } else {
-        writeln!(d.tx, "error: Failed to initialize sdcard.").ok();
-    }
 
     // Initialize filesystem.
     let mut volume_mgr = VolumeManager::new(sdcard, MyTimeSource {});
     let volume0 = volume_mgr
         .open_raw_volume(embedded_sdmmc::VolumeIdx(0))
-        .unwrap();
-    let root_dir = volume_mgr.open_root_dir(volume0).unwrap();
-    // TODO: List all files in root_dir for debugging, remove this after testing.
-    volume_mgr
-        .iterate_dir(root_dir, |entry| {
-            writeln!(d.tx, "Entry: {:?}", entry).ok();
-        })
-        .unwrap();
-    writeln!(d.tx, "Filesystem initialized.").ok();
+        .map_err(|_| ())?;
+    let root_dir = volume_mgr.open_root_dir(volume0).map_err(|_| ())?;
+    writeln!(d.tx, "filesystem initialized success.").ok();
 
     // Read configuration from `config.toml`.
-    let mut cfg_state = true;
-    // TODO: Change to realname after testing.
-    let bl808_cfg = "CONFIG~1.TOM";
-    if volume_mgr
-        .find_directory_entry(root_dir, bl808_cfg)
-        .is_err()
-    {
-        cfg_state = false;
-        writeln!(d.tx, "warning: cannot find config file `/config.toml`, using default configuration from DTB file.").ok();
-    }
-    let config_file = volume_mgr
-        .open_file_in_dir(root_dir, bl808_cfg, Mode::ReadOnly)
-        .unwrap();
-    // Read config from raw file.
     // TODO: Use toml crate to parse config file in later versions.
+    let bl808_cfg = "CONFIG~1.TOM";
     let buffer = &mut [0u8; 128];
-    volume_mgr.read(config_file, buffer).ok();
-    c.bootargs = *buffer;
-
-    let bootargs = core::str::from_utf8(&c.bootargs).unwrap();
-    let start_pos = bootargs.find("bootargs = ").unwrap();
-    let string = &bootargs[start_pos..bootargs.len()];
-    writeln!(d.tx, "Bootargs: {}", string).ok();
+    if load_file_into_memory(
+        &mut volume_mgr,
+        root_dir,
+        bl808_cfg,
+        buffer.as_mut_ptr() as usize,
+        128,
+    )
+    .is_err()
+    {
+        writeln!(d.tx, "error: cannot load config file `config.toml`.").ok();
+        return Err(());
+    }
+    let config_str = core::str::from_utf8(buffer).map_err(|_| ())?;
+    let start_pos = config_str.find("bootargs = ").ok_or(())?;
+    c.bootargs = heapless::String::from_str(&config_str[start_pos + 11..config_str.len()])
+        .map_err(|_| ())?;
+    writeln!(d.tx, "read config success: bootargs = {}", c.bootargs,).ok();
 
     // Load `bl808.dtb` to memory.
-    let mut dtb_state = true;
-    // TODO: Change to realname after testing.
-    let bl808_dtb = "HWDTB~1.5M";
-    let _dtb_addr = 0x51ff_8000;
-    if volume_mgr
-        .find_directory_entry(root_dir, bl808_dtb)
-        .is_err()
-    {
-        dtb_state = false;
-        writeln!(
-            d.tx,
-            "error: cannot find device tree blob file `bl808.dtb`, aborting bootload process.
-"
-        )
-        .ok();
+    let bl808_dtb = "BL808.DTB";
+    let dtb_addr = 0x51ff_8000;
+    let res = load_file_into_memory(&mut volume_mgr, root_dir, bl808_dtb, dtb_addr, 64 * 1024);
+    if res.is_err() {
+        writeln!(d.tx, "error: cannot load dtb file `bl808.dtb`.").ok();
+        return Err(());
     }
-    let dtb_file = volume_mgr
-        .open_file_in_dir(root_dir, bl808_dtb, Mode::ReadOnly)
-        .unwrap();
-    let dtb_file_size = volume_mgr.file_length(dtb_file).unwrap() as f32 / 1024.0;
-    if dtb_file_size > 64.0 {
-        dtb_state = false;
-        writeln!(d.tx, "error: /bl808.dtb: file size is {:.2} KB, but maximum supported device tree blob size is 64KB.", dtb_file_size).ok();
-    } else {
-        let buffer = &mut [0u8; 64 * 1024];
-        volume_mgr.read(dtb_file, buffer).ok();
-        // TODO: Uncomment this unsafe code only when you are sure that the 'dtb' file is valid.
-        // unsafe {core::ptr::copy(buffer.as_ptr(), dtb_addr as *mut u8, buffer.len())};
-    }
-    if dtb_state {
-        writeln!(d.tx, "Loading `bl808.dtb` success").ok();
-    } else {
-        writeln!(d.tx, "error: Loading `bl808.dtb` failed").ok();
-    }
-
-    volume_mgr.close_file(dtb_file).ok();
+    writeln!(d.tx, "load dtb file success, size = {} bytes", res.unwrap()).ok();
 
     // Load `zImage` to memory.
-    let mut zimage_state = true;
-    // TODO: Change to realname after testing.
-    let bl808_z_img = "HWDTB~1.5M";
-    let _z_image_addr = 0x5000_0000;
-    if volume_mgr
-        .find_directory_entry(root_dir, bl808_z_img)
-        .is_err()
-    {
-        zimage_state = false;
-        writeln!(
-            d.tx,
-            "error: cannot find device tree blob file `bl808_zImg`, aborting bootload process.
-"
-        )
-        .ok();
+    let bl808_z_img = "ZIMAGE";
+    let z_image_addr = 0x5000_0000;
+    let res = load_file_into_memory(
+        &mut volume_mgr,
+        root_dir,
+        bl808_z_img,
+        z_image_addr,
+        32 * 1024 * 1024,
+    );
+    if res.is_err() {
+        writeln!(d.tx, "error: cannot load zImage file `zImage`.").ok();
+        return Err(());
     }
-    let z_image_file = volume_mgr
-        .open_file_in_dir(root_dir, bl808_z_img, Mode::ReadOnly)
-        .unwrap();
-
-    let z_image_file_size =
-        volume_mgr.file_length(z_image_file).unwrap() as f32 / (1024.0 * 1024.0);
-    if z_image_file_size > 31.96875 {
-        zimage_state = false;
-        writeln!(
-                d.tx,
-                "error: /bl808.zImg: file size is {:.5} MB, but maximum supported zImage size is 31.96875MB.", z_image_file_size).ok();
-    } else {
-        let buffer = &mut [0u8; 32736 * 1024];
-        volume_mgr.read(z_image_file, buffer).ok();
-        // TODO: Uncomment this unsafe code only when you are sure that the 'z_img' file is valid.
-        // unsafe {core::ptr::copy(buffer.as_ptr(), z_image_addr as *mut u8, buffer.len())};
-    }
-
-    if zimage_state {
-        writeln!(d.tx, "Loading `bl808.zImg` success").ok();
-    } else {
-        writeln!(d.tx, "error: Loading `bl808.zImg` failed").ok();
-    }
-
-    volume_mgr.close_file(z_image_file).ok();
+    writeln!(
+        d.tx,
+        "load zImage file success, size = {} bytes",
+        res.unwrap()
+    )
+    .ok();
 
     volume_mgr.close_dir(root_dir).unwrap();
+    writeln!(d.tx, "load files from sdcard success.").ok();
+    Ok(())
+}
 
-    let state = sd_state & cfg_state & dtb_state & zimage_state;
-    match state {
-        true => {
-            writeln!(d.tx, "load_from_sdcard success").ok();
-            state
-        }
-        false => {
-            writeln!(d.tx, "load_from_sdcard failed").ok();
-            state
-        }
+fn load_file_into_memory<T: embedded_sdmmc::BlockDevice>(
+    volume_mgr: &mut VolumeManager<T, MyTimeSource>,
+    dir: embedded_sdmmc::RawDirectory,
+    file_name: &str,
+    addr: usize,
+    max_size: u32,
+) -> Result<usize, ()> {
+    // TODO: return error message
+    volume_mgr
+        .find_directory_entry(dir, file_name)
+        .map_err(|_| ())?;
+    let file = volume_mgr
+        .open_file_in_dir(dir, file_name, Mode::ReadOnly)
+        .map_err(|_| ())?;
+    let file_size = volume_mgr.file_length(file).map_err(|_| ())?;
+    if file_size > max_size {
+        return Err(());
     }
+    let target = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, file_size as usize) };
+    let size = volume_mgr.read(file, target).map_err(|_| ())?;
+    volume_mgr.close_file(file).ok();
+    Ok(size)
 }
 
 fn run_payload() -> ! {
@@ -298,7 +246,7 @@ fn run_cli<
     const I: usize,
 >(
     d: &mut Device<W, R, L, SPI, PADS, I>,
-    _c: &mut Config,
+    c: &mut Config,
 ) -> ! {
     #[derive(Command)]
     enum Base<'a> {
@@ -323,7 +271,7 @@ fn run_cli<
             command: Option<BootargsCommand<'a>>,
         },
         ///print the infomation in configs.bootargs
-        Print, 
+        Print,
     }
 
     #[derive(Command)]
@@ -384,7 +332,7 @@ fn run_cli<
                         },
                     },
                     Base::Reload => {
-                        load_from_sdcard(d, _c);
+                        let _ = load_from_sdcard(d, c);
                     }
                     Base::Read { addr } => match parse_hex(addr) {
                         Some(a) => {
@@ -405,17 +353,15 @@ fn run_cli<
                             .writer()
                             .write_str("Error: Invalid address or value!")
                             .unwrap(),
-                    }
+                    },
                     Base::Bootargs { command } => match command {
                         Some(BootargsCommand::Get) => {
-                            writeln!(d.tx, "Bootargs: {:?}", _c.bootargs).ok();
+                            writeln!(d.tx, "Bootargs: {:?}", c.bootargs).ok();
                         }
                         Some(BootargsCommand::Set { bootarg }) => match bootarg {
                             Some(bootarg) => {
-                                let bootarg = bootarg.as_bytes();
-                                let len = core::cmp::min(bootarg.len(), _c.bootargs.len());
-                                _c.bootargs[..len].copy_from_slice(&bootarg[..len]);
-                                writeln!(d.tx, "Bootargs set to: {:?}", _c.bootargs).ok();
+                                c.bootargs = heapless::String::from_str(bootarg).unwrap();
+                                writeln!(d.tx, "Bootargs set to: {:?}", c.bootargs).ok();
                             }
                             None => {
                                 writeln!(d.tx, "Please enter the parameters of bootargs set").ok();
@@ -430,7 +376,7 @@ fn run_cli<
                     }
                     Base::Print => {
                         // Print the information about the configs.bootargs variable
-                        writeln!(d.tx, "configs.bootargs = {:?}", _c.bootargs).ok();
+                        writeln!(d.tx, "configs.bootargs = {:?}", c.bootargs).ok();
                     }
                 }
                 Ok(())
@@ -487,42 +433,4 @@ pub(crate) fn read_memory(addr: u32) -> u32 {
 #[inline]
 pub(crate) fn write_memory(addr: u32, val: u32) {
     unsafe { ptr::write_volatile(addr as *mut u32, val) }
-}
-
-/// Sets a sequence of bits in a 32-bit unsigned integer.
-///
-/// # Arguments
-///
-/// * `val` - The original value where bits will be set.
-/// * `pos` - The position to start setting bits.
-/// * `len` - The number of bits to be set.
-/// * `val_in` - The value to be inserted into `val` at the specified position.
-///
-/// # Returns
-///
-/// A new `u32` value with the specified bits set.
-#[inline]
-pub(crate) fn set_bits(val: u32, pos: u32, len: u32, val_in: u32) -> u32 {
-    let mask = ((1 << len) - 1) << pos;
-    (val & !mask) | ((val_in << pos) & mask)
-}
-
-/// A function to perform a busy-wait loop for approximately the given number of microseconds.
-/// Note: The actual delay may vary depending on the system's processing speed.
-#[inline]
-pub(crate) fn sleep_us(_: u32) {
-    for _ in 0..1000 {
-        unsafe { asm!("nop") }
-    }
-}
-
-/// A function to perform a busy-wait loop for approximately the given number of milliseconds.
-/// Note: It internally calls `sleep_us` to achieve the delay.
-///
-/// # Arguments
-///
-/// * `n` - The number of milliseconds to wait.
-#[inline]
-pub(crate) fn sleep_ms(n: u32) {
-    sleep_us(n);
 }
