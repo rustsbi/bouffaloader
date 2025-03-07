@@ -1,8 +1,11 @@
 #![no_std]
 
 mod config;
+pub mod error;
 pub mod sdcard;
 pub mod utils;
+
+pub use error::Error;
 
 use bouffalo_hal::spi::Spi;
 use core::clone::Clone;
@@ -61,15 +64,6 @@ pub struct DynamicInfo {
     pub next_mode: usize,
     /// M-mode firmware options; its definition varies between SBI implementations.
     pub options: usize,
-    /// Boot hart ID of current encironment.
+    /// Boot hart ID of current environment.
     pub boot_hart: usize,
-}
-
-/// Errors that can occur during the loading process.
-#[derive(Debug)]
-pub enum Error {
-    /// The file length is too long.
-    FileLengthError(u32),
-    /// The file failed to load.
-    FileLoadError,
 }

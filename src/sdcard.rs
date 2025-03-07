@@ -101,7 +101,7 @@ pub fn load_from_sdcard<
         firmware_path
     )
     .ok();
-    let result: Result<usize, Error> =
+    let result =
         load_file_into_memory(&mut volume_mgr, firmware, FIRMWARE_ADDRESS, FIRMWARE_LENGTH);
     match result {
         Ok(bytes) => {
@@ -112,12 +112,17 @@ pub fn load_from_sdcard<
             )
             .ok();
         }
-        Err(Error::FileLengthError(size)) => {
+        Err(Error::FileLength(size)) => {
             writeln!(d.tx, "error: /config.toml: file size for firmware {} is {} bytes, but maximum supported firmware size on the current platform (BL808) is 32,704 KiB.", firmware_path, size).ok();
             return Err(());
         }
-        Err(Error::FileLoadError) => {
-            writeln!(d.tx, "error: cannot load file `{}`.", file_name).ok();
+        Err(Error::BlockDevice(e)) => {
+            writeln!(
+                d.tx,
+                "error: cannot load file `{}` for underlying block device error: {:?}",
+                file_name, e
+            )
+            .ok();
             return Err(());
         }
     }
@@ -152,8 +157,7 @@ pub fn load_from_sdcard<
         note: /config.toml: `config.bootargs` is set to `console=ttyS0,115200n8 root=/dev/mmcblk0p2 rw rootwait quiet` in the configuration.").ok();
     }
     // Load `bl808.dtb`.
-    let result: Result<usize, Error> =
-        load_file_into_memory(&mut volume_mgr, dtb, OPAQUE_ADDRESS, OPAQUE_LENGTH);
+    let result = load_file_into_memory(&mut volume_mgr, dtb, OPAQUE_ADDRESS, OPAQUE_LENGTH);
     match result {
         Ok(bytes) => {
             writeln!(
@@ -163,12 +167,17 @@ pub fn load_from_sdcard<
             )
             .ok();
         }
-        Err(Error::FileLengthError(size)) => {
+        Err(Error::FileLength(size)) => {
             writeln!(d.tx, "error: /config.toml: file size for dtb {} is {} bytes, but maximum supported dtb size on the current platform (BL808) is 64 KiB.", dtb_path, size).ok();
             return Err(());
         }
-        Err(Error::FileLoadError) => {
-            writeln!(d.tx, "error: cannot load file `{}`.", file_name).ok();
+        Err(Error::BlockDevice(e)) => {
+            writeln!(
+                d.tx,
+                "error: cannot load file `{}` for underlying block device error: {:?}",
+                file_name, e
+            )
+            .ok();
             return Err(());
         }
     }
@@ -178,25 +187,22 @@ pub fn load_from_sdcard<
 }
 
 /// Loads a file from SD card into specified memory address.
+// FIXME: should be an unsafe function?
 pub fn load_file_into_memory<T: BlockDevice>(
     volume_mgr: &mut VolumeManager<T, MyTimeSource>,
     file: RawFile,
     addr: usize,
     max_size: u32,
-) -> Result<usize, Error> {
+) -> Result<usize, Error<T::Error>> {
     // Check file size.
-    let file_size = volume_mgr
-        .file_length(file)
-        .map_err(|_| Error::FileLoadError)?;
+    let file_size = volume_mgr.file_length(file)?;
     if file_size > max_size {
-        return Err(Error::FileLengthError(file_size));
+        return Err(Error::FileLength(file_size));
     }
 
     // Read file content into memory.
     let target = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, file_size as usize) };
-    let size = volume_mgr
-        .read(file, target)
-        .map_err(|_| Error::FileLoadError)?;
+    let size = volume_mgr.read(file, target)?;
     volume_mgr.close_file(file).ok();
 
     Ok(size)
