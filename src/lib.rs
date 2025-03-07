@@ -1,5 +1,6 @@
 #![no_std]
 
+mod config;
 pub mod sdcard;
 pub mod utils;
 

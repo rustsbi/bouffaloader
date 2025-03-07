@@ -1,13 +1,10 @@
-use super::{Config, Device, Error};
+use super::{Config, Device, Error, config::*};
 use embedded_hal::digital::OutputPin;
 use embedded_io::{Read, Write};
 use embedded_sdmmc::{
     BlockDevice, Mode, RawDirectory, RawFile, SdCard, TimeSource, Timestamp, VolumeManager,
 };
 use riscv::delay::McycleDelay;
-
-const FIRMWARE_ADDRESS: usize = 0x5000_0000; // Load address of firmware.
-const OPAQUE_ADDRESS: usize = 0x51FF_8000; // Address of the device tree blob.
 
 /// Time source implementation for SD card filesystem.
 pub struct MyTimeSource {}
@@ -104,12 +101,8 @@ pub fn load_from_sdcard<
         firmware_path
     )
     .ok();
-    let result: Result<usize, Error> = load_file_into_memory(
-        &mut volume_mgr,
-        firmware,
-        FIRMWARE_ADDRESS,
-        (32 * 1024 - 64) * 1024,
-    );
+    let result: Result<usize, Error> =
+        load_file_into_memory(&mut volume_mgr, firmware, FIRMWARE_ADDRESS, FIRMWARE_LENGTH);
     match result {
         Ok(bytes) => {
             writeln!(
@@ -160,7 +153,7 @@ pub fn load_from_sdcard<
     }
     // Load `bl808.dtb`.
     let result: Result<usize, Error> =
-        load_file_into_memory(&mut volume_mgr, dtb, OPAQUE_ADDRESS, 64 * 1024);
+        load_file_into_memory(&mut volume_mgr, dtb, OPAQUE_ADDRESS, OPAQUE_LENGTH);
     match result {
         Ok(bytes) => {
             writeln!(
