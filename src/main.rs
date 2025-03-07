@@ -1,23 +1,21 @@
 #![no_std]
 #![no_main]
 
-mod lib;
-mod sdcard;
-mod utils;
-
 use bouffalo_hal::{prelude::*, psram::init_psram, spi::Spi, uart::Config as UartConfig};
-use bouffalo_rt::{entry, Clocks, Peripherals};
+use bouffalo_rt::{Clocks, Peripherals, entry};
+use bouffaloader::{Device, DynamicInfo};
+use bouffaloader::{
+    sdcard,
+    utils::{format_hex, parse_hex, read_memory, write_memory},
+};
+use core::fmt::Write as _;
 use core::ptr;
-use core::{fmt::Write as _, str::FromStr};
-use embedded_cli::{cli::CliBuilder, Command};
+use embedded_cli::{Command, cli::CliBuilder};
 use embedded_hal::{digital::OutputPin, spi::MODE_3};
 use embedded_io::{Read, Write};
 use embedded_time::rate::*;
 use heapless::String;
 use panic_halt as _;
-use utils::{format_hex, parse_hex, read_memory, write_memory};
-
-use crate::lib::{Configs, Device, DynamicInfo};
 
 static DYNAMIC_INFO: DynamicInfo = DynamicInfo {
     magic: 0x4942534f,
@@ -57,7 +55,6 @@ fn main(p: Peripherals, c: Clocks) -> ! {
     };
     let mut d = Device { tx, rx, led, spi };
     let mut bootargs = String::new();
-    let mut opaque_addr: usize = 0;
     // Display welcome message.
     writeln!(d.tx, "Welcome to bouffaloader🦀!").ok();
 
@@ -66,13 +63,13 @@ fn main(p: Peripherals, c: Clocks) -> ! {
     writeln!(d.tx, "PSRAM initialization success").ok();
 
     // Initialize sdcard and load files.
-    if let Ok(opaque) = sdcard::load_from_sdcard(&mut d) {
-        opaque_addr = opaque;
+    let opaque_addr = if let Ok(opaque) = sdcard::load_from_sdcard(&mut d) {
         writeln!(d.tx, "load files from sdcard success.").ok();
+        opaque
     } else {
         writeln!(d.tx, "Load from sdcard fail").ok();
         run_cli(&mut d, &mut bootargs);
-    }
+    };
 
     // Check button states for CLI mode.
     let mut button_1 = p.gpio.io22.into_pull_up_input();
@@ -96,7 +93,9 @@ fn run_payload(opaque_addr: usize) -> ! {
         entry(FIRMWARE_ADDRESS, opaque_addr, &DYNAMIC_INFO);
     }
 
-    loop {}
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// Runs the Command Line Interface
@@ -228,8 +227,10 @@ fn run_cli<
                         Some(BootargsCommand::Set { bootarg }) => match bootarg {
                             Some(bootarg) => {
                                 b.clear();
-                                b.push_str(bootarg);
-                                writeln!(d.tx, "Bootargs set to: {:?}", b).ok();
+                                match b.push_str(bootarg) {
+                                    Ok(_) => writeln!(d.tx, "Bootargs set to: {:?}", b).ok(),
+                                    Err(_) => writeln!(d.tx, "Cannot set bootargs for it's too long for current environment: {:?}", b).ok()
+                                };
                             }
                             None => {
                                 writeln!(d.tx, "Please enter the parameters of bootargs set").ok();

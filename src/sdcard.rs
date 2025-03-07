@@ -1,10 +1,13 @@
-use crate::lib::{Config, Device, Error};
+use super::{Config, Device, Error};
 use embedded_hal::digital::OutputPin;
 use embedded_io::{Read, Write};
 use embedded_sdmmc::{
     BlockDevice, Mode, RawDirectory, RawFile, SdCard, TimeSource, Timestamp, VolumeManager,
 };
 use riscv::delay::McycleDelay;
+
+const FIRMWARE_ADDRESS: usize = 0x5000_0000; // Load address of firmware.
+const OPAQUE_ADDRESS: usize = 0x51FF_8000; // Address of the device tree blob.
 
 /// Time source implementation for SD card filesystem.
 pub struct MyTimeSource {}
@@ -69,149 +72,112 @@ pub fn load_from_sdcard<
         return Err(());
     }
 
-    const FIRMWARE_ADDRESS: usize = 0x5000_0000; // Load address of firmware.
-    const OPAQUE_ADDRESS: usize = 0x51FF_8000; // Address of the device tree blob.
-
     // Parse configuration.
-    if let Ok(toml_str) = core::str::from_utf8(buffer) {
-        if let Ok(config) = picotoml::from_str::<Config>(toml_str) {
-            // Load firmware.
-            if let Some(firmware) = config.configs.firmware {
-                let file_path = firmware.as_str();
-                let (file_dir, file_name) = locate_file_by_path(&mut d.tx, "firmware", file_path);
-                if let Ok(firmware) =
-                    open_file_by_path(&mut volume_mgr, root_dir, file_dir, file_name)
-                {
-                    writeln!(
-                        d.tx,
-                        "info: /config.toml: firmware located on {}.",
-                        file_path
-                    )
-                    .ok();
-                    let result: Result<usize, Error> = load_file_into_memory(
-                        &mut volume_mgr,
-                        firmware,
-                        FIRMWARE_ADDRESS,
-                        (32 * 1024 - 64) * 1024,
-                    );
-                    match result {
-                        Ok(bytes) => {
-                            writeln!(
-                                d.tx,
-                                "info: load {} success, size = {} bytes",
-                                file_name, bytes
-                            )
-                            .ok();
-                        }
-                        Err(Error::FileLengthError(size)) => {
-                            writeln!(d.tx, "error: /config.toml: file size for firmware {} is {} bytes, but maximum supported firmware size on the current platform (BL808) is 32,704 KiB.", file_path, size).ok();
-                            return Err(());
-                        }
-                        Err(Error::FileLoadError) => {
-                            writeln!(d.tx, "error: cannot load file `{}`.", file_name).ok();
-                            return Err(());
-                        }
-                    }
-                } else {
-                    writeln!(
-                        d.tx,
-                        "error: /config.toml: file not found for firmware path {}.",
-                        file_path
-                    )
-                    .ok();
-                    return Err(());
-                }
-            } else {
-                writeln!(d.tx, "warning: /config.toml: cannot find firmware path on key `configs.firmware`, using default configuration (/zImage).").ok();
-                // Load `zImage` as default configuration.
-                if let Ok(zimage) = volume_mgr.open_file_in_dir(root_dir, "ZIMAGE", Mode::ReadOnly)
-                {
-                    writeln!(d.tx, "info: zImage located on /zImage.").ok();
-                    let result: Result<usize, Error> = load_file_into_memory(
-                        &mut volume_mgr,
-                        zimage,
-                        FIRMWARE_ADDRESS,
-                        (32 * 1024 - 64) * 1024,
-                    );
-                    match result {
-                        Ok(bytes) => {
-                            writeln!(d.tx, "info: load zImage success, size = {} bytes", bytes)
-                                .ok();
-                        }
-                        Err(Error::FileLengthError(size)) => {
-                            writeln!(d.tx, "error: file size for zImage is {} bytes, but maximum supported firmware size on the current platform (BL808) is 32,704 KiB.", size).ok();
-                            return Err(());
-                        }
-                        Err(Error::FileLoadError) => {
-                            writeln!(d.tx, "error: cannot load file `zImage`.").ok();
-                            return Err(());
-                        }
-                    }
-                } else {
-                    writeln!(d.tx, "error: file not found for firmware path /zImage.").ok();
-                    return Err(());
-                }
-            }
-            // Load device tree blob.
-            if let Some(opaque) = config.configs.opaque {
-                let dtb_path = opaque.as_str();
-                let (file_dir, file_name) = locate_file_by_path(&mut d.tx, "dtb", dtb_path);
-                if let Ok(dtb) = open_file_by_path(&mut volume_mgr, root_dir, file_dir, file_name) {
-                    writeln!(d.tx, "info: /config.toml: dtb located on {}.", dtb_path).ok();
-                    // TODO: apply bootargs to dtb.
-                    if is_dtb_format(&mut volume_mgr, dtb) {
-                        if let Some(bootargs) = config.configs.bootargs {
-                            writeln!(d.tx, "info: /config.toml: bootargs set to `{}`.", bootargs)
-                                .ok();
-                        } else {
-                            writeln!(d.tx, "warning: /config.toml: cannot find bootargs on key `configs.bootargs`, using default bootargs in DTB.").ok();
-                        }
-                    } else {
-                        writeln!(d.tx, "warning: /config.toml: bootargs is unused, as `config.opaque` does not include an opaque information file in DTB format.
-                        note: /config.toml: `config.bootargs` is set to `console=ttyS0,115200n8 root=/dev/mmcblk0p2 rw rootwait quiet` in the configuration.").ok();
-                    }
-                    // Load `bl808.dtb`.
-                    let result: Result<usize, Error> =
-                        load_file_into_memory(&mut volume_mgr, dtb, 0x51ff_8000, 64 * 1024);
-                    match result {
-                        Ok(bytes) => {
-                            writeln!(
-                                d.tx,
-                                "info: load {} success, size = {} bytes",
-                                file_name, bytes
-                            )
-                            .ok();
-                        }
-                        Err(Error::FileLengthError(size)) => {
-                            writeln!(d.tx, "error: /config.toml: file size for dtb {} is {} bytes, but maximum supported dtb size on the current platform (BL808) is 64 KiB.", dtb_path, size).ok();
-                            return Err(());
-                        }
-                        Err(Error::FileLoadError) => {
-                            writeln!(d.tx, "error: cannot load file `{}`.", file_name).ok();
-                            return Err(());
-                        }
-                    }
-                } else {
-                    writeln!(
-                        d.tx,
-                        "error: /config.toml: file not found for dtb path {}.",
-                        dtb_path
-                    )
-                    .ok();
-                    return Err(());
-                }
-            } else {
-                writeln!(d.tx, "warning: /config.toml: cannot find opaque file path on key `configs.opaque`, using default configuration (zeroing `a1` for non-existing opaque file).").ok();
-                volume_mgr.close_dir(root_dir).unwrap();
-                return Ok(0x0);
-            }
-        } else {
-            writeln!(d.tx, "error: invalid toml format.").ok();
-            return Err(());
-        }
-    } else {
+    let Ok(toml_str) = core::str::from_utf8(buffer) else {
         writeln!(d.tx, "error: invalid config encoding.").ok();
         return Err(());
+    };
+
+    let Ok(config) = picotoml::from_str::<Config>(toml_str) else {
+        writeln!(d.tx, "error: invalid toml format.").ok();
+        return Err(());
+    };
+
+    // Load firmware.
+    let firmware_path = config.configs.firmware.as_ref().map(|s| s.as_str()).unwrap_or_else(|| {
+        writeln!(d.tx, "warning: /config.toml: cannot find firmware path on key `configs.firmware`, using default configuration (/zImage).").ok();
+        "ZIMAGE"
+    });
+    let (file_dir, file_name) = locate_file_by_path(&mut d.tx, "firmware", firmware_path);
+    let Ok(firmware) = open_file_by_path(&mut volume_mgr, root_dir, file_dir, file_name) else {
+        writeln!(
+            d.tx,
+            "error: /config.toml: file not found for firmware path {}.",
+            firmware_path
+        )
+        .ok();
+        return Err(());
+    };
+    writeln!(
+        d.tx,
+        "info: /config.toml: firmware located on {}.",
+        firmware_path
+    )
+    .ok();
+    let result: Result<usize, Error> = load_file_into_memory(
+        &mut volume_mgr,
+        firmware,
+        FIRMWARE_ADDRESS,
+        (32 * 1024 - 64) * 1024,
+    );
+    match result {
+        Ok(bytes) => {
+            writeln!(
+                d.tx,
+                "info: load {} success, size = {} bytes",
+                file_name, bytes
+            )
+            .ok();
+        }
+        Err(Error::FileLengthError(size)) => {
+            writeln!(d.tx, "error: /config.toml: file size for firmware {} is {} bytes, but maximum supported firmware size on the current platform (BL808) is 32,704 KiB.", firmware_path, size).ok();
+            return Err(());
+        }
+        Err(Error::FileLoadError) => {
+            writeln!(d.tx, "error: cannot load file `{}`.", file_name).ok();
+            return Err(());
+        }
+    }
+
+    // Load device tree blob.
+    let Some(opaque) = config.configs.opaque else {
+        writeln!(d.tx, "warning: /config.toml: cannot find opaque file path on key `configs.opaque`, using default configuration (zeroing `a1` for non-existing opaque file).").ok();
+        volume_mgr.close_dir(root_dir).unwrap();
+        return Ok(0x0);
+    };
+    let dtb_path = opaque.as_str();
+    let (file_dir, file_name) = locate_file_by_path(&mut d.tx, "dtb", dtb_path);
+    let Ok(dtb) = open_file_by_path(&mut volume_mgr, root_dir, file_dir, file_name) else {
+        writeln!(
+            d.tx,
+            "error: /config.toml: file not found for dtb path {}.",
+            dtb_path
+        )
+        .ok();
+        return Err(());
+    };
+    writeln!(d.tx, "info: /config.toml: dtb located on {}.", dtb_path).ok();
+    // TODO: apply bootargs to dtb.
+    if is_dtb_format(&mut volume_mgr, dtb) {
+        if let Some(bootargs) = config.configs.bootargs {
+            writeln!(d.tx, "info: /config.toml: bootargs set to `{}`.", bootargs).ok();
+        } else {
+            writeln!(d.tx, "warning: /config.toml: cannot find bootargs on key `configs.bootargs`, using default bootargs in DTB.").ok();
+        }
+    } else {
+        writeln!(d.tx, "warning: /config.toml: bootargs is unused, as `config.opaque` does not include an opaque information file in DTB format.
+        note: /config.toml: `config.bootargs` is set to `console=ttyS0,115200n8 root=/dev/mmcblk0p2 rw rootwait quiet` in the configuration.").ok();
+    }
+    // Load `bl808.dtb`.
+    let result: Result<usize, Error> =
+        load_file_into_memory(&mut volume_mgr, dtb, OPAQUE_ADDRESS, 64 * 1024);
+    match result {
+        Ok(bytes) => {
+            writeln!(
+                d.tx,
+                "info: load {} success, size = {} bytes",
+                file_name, bytes
+            )
+            .ok();
+        }
+        Err(Error::FileLengthError(size)) => {
+            writeln!(d.tx, "error: /config.toml: file size for dtb {} is {} bytes, but maximum supported dtb size on the current platform (BL808) is 64 KiB.", dtb_path, size).ok();
+            return Err(());
+        }
+        Err(Error::FileLoadError) => {
+            writeln!(d.tx, "error: cannot load file `{}`.", file_name).ok();
+            return Err(());
+        }
     }
 
     volume_mgr.close_dir(root_dir).unwrap();
